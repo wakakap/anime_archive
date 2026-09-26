@@ -1,0 +1,949 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>アニメ配信データ</title>
+<meta name="description" content="正規配信プラットフォームのアニメ視聴データ。クール別ランキング。">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>🌙</text></svg>">
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <div class="titles">
+      <h1>アニメ配信データ<span class="dot">.</span></h1>
+      <div class="sub" id="stamp">読み込み中…</div>
+    </div>
+    <!-- メンテナンスの入口。**手元（受信器あり）でだけ**出す。公開版には採集の口が無いので
+         押せてもできることが無い（編集の欄と同じ考え。README §6.1）。 -->
+    <div class="tools" id="tools"></div>
+  </header>
+
+  <div class="plats" id="plats"></div>
+
+  <div class="bar">
+    <select id="season"></select>
+    <span class="spacer"></span>
+    <span class="note" id="platnote"></span>
+  </div>
+
+  <div id="body"></div>
+
+</div>
+
+<script src="assets/app.js"></script>
+<script>
+"use strict";
+
+// 状態はこの 3 つだけ。URL にも載せる（?p=abema&s=2026-summer）ので
+// 特定のクールへのリンクをそのまま貼れる。
+let INDEX = null, PLATFORM = null, SEASON = null;
+
+const qs = new URLSearchParams(location.search);
+
+function setUrl() {
+  const u = new URL(location.href);
+  u.searchParams.set("p", PLATFORM);
+  if (SEASON) u.searchParams.set("s", SEASON);
+  // 地区（Netflix）。地区の無い平台では消す
+  if (PLATFORM === "netflix" && REGION) u.searchParams.set("r", REGION);
+  else u.searchParams.delete("r");
+  history.replaceState(null, "", u);
+}
+
+/** 今の平台の主指標の名前。ABEMA は「視聴数」、niconico は「再生数」。 */
+function metricName() {
+  const p = INDEX && INDEX.platforms.find((x) => x.id === PLATFORM);
+  return (p && p.metrics && p.metrics[0] && p.metrics[0].name) || "視聴数";
+}
+
+function rankRow(w, eng) {
+  const ret = w.retention;
+  const bar = ret == null ? "" :
+    `<div class="ret"><span>${(ret * 100).toFixed(0)}%</span>
+       <span class="track"><span class="fill" style="width:${
+         Math.min(100, ret * 100).toFixed(0)}%"></span></span></div>`;
+  return `<tr>
+    <td class="rank">${w.rank}</td>
+    <td class="title-cell">
+      <a href="work.html?id=${w.work_id}&p=${AD.esc(PLATFORM)}&s=${AD.esc(SEASON)}"
+         >${AD.esc(w.cour_name || w.title)}</a>
+      <span class="meta">${AD.esc(w.format || "")} ${
+        w.planned_eps ? "全" + w.planned_eps + "話" : ""}
+        <span class="pill ${AD.esc(w.match)}">${AD.esc(w.match)}</span>${
+        (w.seasons && w.seasons.length > 1) ? `<span class="pill" style="color:var(--cyan)"
+          title="${AD.esc(w.seasons.join(" / "))} にまたがる作品。このクールは ${w.cour_index} クール目"
+          >${w.seasons.length}クール作品・${w.cour_index}クール目</span>` : ""}${
+        w.sliced ? `<span class="pill" style="color:var(--accent-2)"
+          title="ep${w.ep_range[0]}..${w.ep_range[1]} だけで数えている（全${w.full_eps}話）"
+          >ep${w.ep_range[0]}–${w.ep_range[1]}</span>` : ""}${
+        w.stale ? `<span class="pill" title="この日は ABEMA の日程に出てこなかった（放送が休みの週など）。最後に観測した ${
+          AD.esc(w.last_day)} の数字をそのまま出している"
+          >最終観測 ${AD.esc(w.last_day)}</span>` : ""}</span>
+    </td>
+    <td class="num">${AD.man(w.total)}</td>
+    <td class="num hide-sm">${w.eps}</td>
+    <td class="num hide-sm">${AD.man(w.ep1)}</td>
+    <td class="num hide-sm">${bar || "—"}</td>
+    <td class="num">${AD.signed(w.delta)}</td>${eng ? `
+    <td class="num" title="${w.comments_day ? AD.esc(w.comments_day) + " 時点" : ""}">${AD.int(w.comments)}</td>
+    <td class="num hide-sm">${AD.signed(w.comments_delta)}</td>
+    <td class="num hide-sm">${AD.int(w.mylists)}</td>
+    <td class="num hide-sm">${AD.signed(w.mylists_delta)}</td>` : ""}
+    <td class="hide-sm" style="width:90px">${AD.spark(w.curve)}</td>
+  </tr>`;
+}
+
+/** 平台の表示名（「TVer 独自」などの札に使う）。 */
+function platName() {
+  const p = INDEX && INDEX.platforms.find((x) => x.id === PLATFORM);
+  return (p && p.name) || PLATFORM;
+}
+
+/**
+ * 登録数で並べるクール別ランキング（doc.kind === "favorite"。いまは TVer）。
+ *
+ * TVer は視聴数を出していない。系列の「登録数」が作品の総量に当たり、話ごとの
+ * 「いいね」は作品ページで見る。登録数は系列のものなので、2 クールにまたがる系列は
+ * 両方のクールに同じ数で出る。登録数の無い行（情報番組の中のコーナー）は順位を付けず末尾に。
+ * いいねは話ごとの**最後に観測した値**の合計（配信が終わった話も含む）。
+ */
+function renderFavoriteSeason(doc) {
+  const rows = doc.works.map((w) => `<tr>
+    <td class="rank">${w.rank == null ? '<span class="dim">—</span>' : w.rank}</td>
+    <td class="title-cell">
+      <a href="work.html?id=${w.work_id}&p=${AD.esc(PLATFORM)}&s=${AD.esc(SEASON)}"
+         >${AD.esc(w.cour_name || w.title)}</a>
+      <span class="meta"><span class="pill ${AD.esc(w.match)}">${AD.esc(w.match)}</span>${
+        (w.seasons && w.seasons.length > 1) ? `<span class="pill" style="color:var(--cyan)"
+          title="${AD.esc(w.seasons.join(" / "))} にまたがる系列。登録数は系列で 1 つ（クールでは割れない）"
+          >${w.seasons.length}クール作品・${w.cour_index}クール目</span>` : ""}${
+        w.sliced ? `<span class="pill" style="color:var(--accent-2)"
+          title="いいねは ep${w.ep_range[0]}..${w.ep_range[1]} だけで数えている"
+          >ep${w.ep_range[0]}–${w.ep_range[1]}</span>` : ""}${
+        w.total == null ? `<span class="pill" title="系列が情報番組なので登録数を採っていない"
+          >登録数なし</span>` : ""}</span>
+    </td>
+    <td class="num">${AD.int(w.total)}</td>
+    <td class="num">${AD.signed(w.delta)}</td>
+    <td class="num hide-sm" title="配信中 ${w.eps_live} 話 / 観測したことのある ${w.eps} 話"
+      >${w.eps_live}<span class="dim">/${w.eps}</span></td>
+    <td class="num hide-sm">${AD.int(w.likes)}</td>
+    <td class="hide-sm" style="width:90px">${AD.spark(w.curve)}</td>
+  </tr>`).join("");
+  return `
+    <div class="panel">
+      <h2>クール別ランキング <span class="tag">登録数</span>
+        <button class="viewtog" type="button" data-view="season"
+                aria-pressed="${VIEW.season ? "true" : "false"}"
+                title="表と登録数の時間変化を切り替える">${VIEW.season ? "表にもどす" : "時間変化"}</button>
+        <span class="hint">${AD.esc(doc.label)} · ${AD.esc(doc.day)} 時点 · ${AD.esc(platName())} は視聴数を公開していない</span></h2>
+      ${VIEW.season ? AD.lineChart(
+          doc.works.filter((w) => (w.history || []).length)
+            .map((w) => ({ name: w.title, points: w.history })),
+          { fmt: (v) => AD.man(v), floor: 0 })
+        : ""}
+      ${doc.works.length && !VIEW.season ? `<table><thead><tr>
+        <th class="rank">#</th><th>作品</th>
+        <th class="num">登録数</th>
+        <th class="num">前回比</th>
+        <th class="num hide-sm" title="最後に観測した日に配信中だった話 / 観測したことのある話">話</th>
+        <th class="num hide-sm" title="本編の話ごとのいいね（最後に観測した値）の合計">いいね</th>
+        <th class="hide-sm">話ごとのいいね</th>
+      </tr></thead><tbody>${rows}</tbody></table>`
+      : (doc.works.length ? "" : `<div class="empty">このクールのデータはまだ無い。</div>`)}
+      <div class="empty" style="padding:12px 16px;text-align:left">
+        <b>いいね</b>は本編の話ごとの数を、最後に観測した値で足したもの。TVer は視聴数を公開していない。
+        再配信で出直した話は<b>いいねが数え直される</b>ので、そのクールの数字には混ぜない ——
+        採らない（<code>tver_closed.json</code>）／採ってしまったぶんは集計から外す
+        （<code>config.json</code> の <code>exclude_episodes</code>）。採った記録は消さない。
+      </div>
+    </div>`;
+}
+
+/* ---- Netflix（週間 TOP10）-------------------------------------------
+ *
+ * Netflix は視聴数を出していない。あるのは週間 TOP10 だけで、国は順位のみ、
+ * グローバルは週の視聴数つき（docs/netflix.md）。単位は**週**（月〜日。日付は日曜）。
+ * 地区は index.json の platforms[].regions（data/config.json の netflix_regions）。
+ * 先頭が既定。選んだ地区は URL の ?r= に載せる。
+ */
+let REGION = qs.get("r") || null;
+const TOP10 = {};          // 地区 → 週間 TOP10（読んだものを控える。切り替えで取り直さない）
+let TOPWEEK = null;        // 週間 TOP10 で見ている週（null = 最新）
+
+function regionOf(regions) {
+  regions = regions || [];
+  if (!regions.some((r) => r.id === REGION)) REGION = regions.length ? regions[0].id : null;
+  return regions.find((r) => r.id === REGION) || { id: REGION, name: REGION || "" };
+}
+
+function regionTabs(regions) {
+  return `<div class="bar" style="margin:0 0 14px">${regions.map((r) =>
+    `<button class="plat" type="button" data-region="${AD.esc(r.id)}"
+       aria-selected="${String(r.id === REGION)}">${AD.esc(r.name)}</button>`).join("")}</div>`;
+}
+
+/** 週（日曜の日付）→「9/7–9/13」。 */
+function weekLabel(d) {
+  if (!d) return "";
+  const end = new Date(d + "T00:00:00");
+  const st = new Date(end.getTime() - 6 * 86400000);
+  return `${st.getMonth() + 1}/${st.getDate()}–${end.getMonth() + 1}/${end.getDate()}`;
+}
+
+function renderWeeklySeason(doc) {
+  const reg = regionOf(doc.regions);
+  const isG = reg.id === "global";
+  const ws = doc.works.filter((w) => w.regions[reg.id])
+    .map((w) => Object.assign({ r: w.regions[reg.id] }, w));
+  ws.sort((a, b) => (b.r.weeks - a.r.weeks) || (a.r.best - b.r.best) ||
+                    ((a.r.last || 99) - (b.r.last || 99)));
+  const absent = doc.works.length - ws.length;
+
+  const rows = ws.map((w, i) => `<tr>
+    <td class="rank">${i + 1}</td>
+    <td class="title-cell">
+      <a href="work.html?id=${w.work_id}&p=${AD.esc(PLATFORM)}&s=${AD.esc(SEASON)}&r=${AD.esc(reg.id)}"
+         >${AD.esc(w.cour_name || w.title)}</a>
+      <span class="meta"><span class="pill ${AD.esc(w.match)}">${AD.esc(w.match)}</span>${
+        (w.seasons && w.seasons.length > 1) ? `<span class="pill" style="color:var(--cyan)"
+          title="${AD.esc(w.seasons.join(" / "))} にまたがる季。Netflix は季が単位なので、どのクールにも同じ記録で出る"
+          >${w.seasons.length}クール作品・${w.cour_index}クール目</span>` : ""}
+        <span class="dim">${AD.esc(w.r.cats.join(" / "))}</span></span>
+    </td>
+    <td class="num">${w.r.best} 位</td>
+    <td class="num">${w.r.weeks}</td>
+    <td class="num">${w.r.last == null ? '<span class="dim">圏外</span>' : w.r.last + " 位"}</td>
+    ${isG ? `<td class="num" title="TOP10 に入った ${w.r.views_weeks} 週の合計">${AD.man(w.r.views)}</td>` : ""}
+    <td class="num hide-sm dim">${AD.esc(w.r.first)} 〜 ${AD.esc(w.r.latest)}</td>
+    <td class="hide-sm" style="width:80px">${AD.rankSpark(w.r.series.map((p) => p.v), 10)}</td>
+  </tr>`).join("");
+
+  const chart = VIEW.season ? AD.lineChart(
+    ws.map((w) => ({ name: w.cour_name || w.title, points: w.r.series })),
+    { invert: true, h: 320, floor: 1, ceil: 10, fmt: (v) => Math.round(v) + " 位" }) : "";
+
+
+  return `
+    ${regionTabs(doc.regions)}
+    <div class="panel">
+      <h2>クール別ランキング <span class="tag">週間 TOP10 · ${AD.esc(reg.name)}</span>
+        <button class="viewtog" type="button" data-view="season"
+                aria-pressed="${VIEW.season ? "true" : "false"}"
+                title="表と順位の時間変化を切り替える">${VIEW.season ? "表にもどす" : "時間変化"}</button>
+        <span class="hint">${AD.esc(doc.label)} · 最新週 ${AD.esc(weekLabel(doc.day))}（${AD.esc(doc.day)}）</span></h2>
+      ${chart}
+      ${ws.length && !VIEW.season ? `<table><thead><tr>
+        <th class="rank">#</th><th>作品</th>
+        <th class="num">最高位</th>
+        <th class="num" title="TOP10 に入った週の数（2021-07 以降）">TOP10 週</th>
+        <th class="num" title="最新週（${AD.esc(doc.day)}）の順位">最新週</th>
+        ${isG ? '<th class="num" title="TOP10 に入った週の視聴数の合計">視聴数</th>' : ""}
+        <th class="num hide-sm">期間</th>
+        <th class="hide-sm">推移</th>
+      </tr></thead><tbody>${rows}</tbody></table>` : ""}
+      ${ws.length ? "" : `<div class="empty">このクールの作品は ${AD.esc(reg.name)} の TOP10 に入っていない。</div>`}
+      <div class="empty" style="padding:12px 16px;text-align:left">
+        ${isG
+          ? "グローバルは番組／映画 × 英語／非英語 の各 10 位。視聴数は TOP10 に入った週だけの合計（入っていない週の数字は公開されない。2023-06 より前は視聴時間のみ）。"
+          : "国別は順位だけ（Netflix は国ごとの視聴数を公開していない）。番組／映画 の各 10 位。"}
+        並びは TOP10 に入った週の多い順 → 最高位。${absent ? `このクールに結んだ作品のうち ${absent} 件は ${AD.esc(reg.name)} では TOP10 に入っていない。` : ""}
+      </div>
+    </div>`;
+}
+
+/** 地区の週間 TOP10。地区ごとのファイルを選んだときに読む。 */
+function renderNetflixTop10(mod) {
+  const reg = regionOf((INDEX.platforms.find((x) => x.id === PLATFORM) || {}).regions);
+  const data = TOP10[reg.id];
+  if (data === undefined) {
+    TOP10[reg.id] = null;
+    AD.json("data/" + mod.file_pattern.replace("{region}", reg.id))
+      .then((d) => { TOP10[reg.id] = d; paint(); })
+      .catch(() => { TOP10[reg.id] = { weeks: [] }; paint(); });
+  }
+  if (!data) return `<div class="panel"><h2>${AD.esc(mod.name)}</h2><div class="empty">読み込み中…</div></div>`;
+  const weeks = data.weeks || [];
+  if (!weeks.length) return "";
+  const cur = weeks.find((w) => w.d === TOPWEEK) || weeks[weeks.length - 1];
+  // 番組を先に。グローバルは非英語を先に（アニメはほぼ非英語の方に入る）
+  const catKey = (c) => (c.startsWith("TV") ? 0 : 2) + (c.includes("(English)") ? 1 : 0);
+  const cats = Object.keys(cur.charts).sort((a, b) => (catKey(a) - catKey(b)) || a.localeCompare(b));
+  const table = (cat) => `<table><thead><tr>
+      <th class="rank">#</th><th>${AD.esc(cat)}</th><th class="num">前週比</th>
+    </tr></thead><tbody>${cur.charts[cat].map((it) => `<tr>
+      <td class="rank">${it.rank}</td>
+      <td class="title-cell">${it.work_id
+        ? `<a href="work.html?id=${it.work_id}&p=${AD.esc(PLATFORM)}&r=${AD.esc(reg.id)}"
+             title="アニメとして結んだ作品">◆ ${AD.esc(it.title)}</a>`
+        : AD.esc(it.title)}</td>
+      <td class="num">${it.back
+        ? '<span class="pill" title="前週は圏外。それより前に TOP10 に入ったことがある">再</span>'
+        : AD.move(it.move, it.prev)}</td>
+    </tr>`).join("")}</tbody></table>`;
+  return `<div class="panel">
+    <h2>${AD.esc(mod.name)} <span class="tag">${AD.esc(reg.name)}</span>
+      <select data-topweek style="margin-left:8px">${weeks.slice().reverse().map((w) =>
+        `<option value="${AD.esc(w.d)}"${w.d === cur.d ? " selected" : ""}>${
+          AD.esc(weekLabel(w.d))}（${AD.esc(w.d)}）</option>`).join("")}</select>
+      <span class="hint">直近 ${weeks.length} 週</span></h2>
+    ${cats.filter((c) => c.startsWith("TV")).map(table).join("")}
+    ${cats.some((c) => !c.startsWith("TV")) ? `<details><summary style="padding:10px 16px;cursor:pointer">映画</summary>
+      ${cats.filter((c) => !c.startsWith("TV")).map(table).join("")}</details>` : ""}
+    <div class="empty" style="padding:12px 16px;text-align:left">${AD.esc(mod.note || "")}
+      NEW は初登場、再 は前週圏外からの返り咲き。</div>
+  </div>`;
+}
+
+/* ---- dアニメストア（視聴数の順位＋気になる数・マイリスト）----------------------------
+ *
+ * 視聴数は出ていないが、全作品（約 7100）の視聴数の**順位**が毎日取れる。数字は
+ * 気になる数（favoriteCount）とマイリスト（myListCount）の 2 つで、どちらも累計（docs/danime.md）。
+ * クール別ランキングは最新の順位の順。平均順位はそのクールの期間の観測日だけで取る。
+ */
+// 切り替え式の順位表で、いまどの表を見ているか。鍵は「板块の id ＋ 束の id」
+// （束が 1 つだけの平台＝dアニメ では束の id が "_"）。
+const CHARTSEL = {};
+
+function rankCell(rank, move, prev) {
+  if (rank == null) return '<span class="dim">—</span>';
+  return `${AD.int(rank)} 位 <span style="font-size:11px">${
+    prev == null ? "" : AD.move(move, prev)}</span>`;
+}
+
+function renderRankCountSeason(doc) {
+  const rows = doc.works.map((w) => `<tr>
+    <td class="rank">${w.rank == null ? '<span class="dim">—</span>' : w.rank}</td>
+    <td class="title-cell">
+      <a href="work.html?id=${w.work_id}&p=${AD.esc(PLATFORM)}&s=${AD.esc(SEASON)}"
+         >${AD.esc(w.cour_name || w.title)}</a>
+      <span class="meta"><span class="pill ${AD.esc(w.match)}">${AD.esc(w.match)}</span>${
+        (w.seasons && w.seasons.length > 1) ? `<span class="pill" style="color:var(--cyan)"
+          title="${AD.esc(w.seasons.join(" / "))} にまたがる作品。順位・気になる数・マイリストは作品に 1 つ（クールでは割れない）。平均順位だけクールごと"
+          >${w.seasons.length}クール作品・${w.cour_index}クール目</span>` : ""}</span>
+    </td>
+    <td class="num">${w.move == null ? '<span class="dim">—</span>' : AD.move(w.move, w.prev)}</td>
+    <td class="num" title="このクールの ${w.avg_days} 日の平均">${w.avg == null ? "—" : w.avg}</td>
+    <td class="num hide-sm">${w.best == null ? "—" : w.best}</td>
+    <td class="num" title="${w.year_day
+      ? AD.esc(w.year_day) + " 時点（直近 12 か月）" : "まだ観測が無い"}">${AD.int(w.year)}</td>
+    <td class="num">${AD.int(w.fav)}</td>
+    <td class="num hide-sm">${AD.signed(w.fav_delta)}</td>
+    <td class="num hide-sm">${AD.int(w.myl)}</td>
+    <td class="num hide-sm">${AD.signed(w.myl_delta)}</td>
+    <td class="hide-sm" style="width:80px">${AD.rankSpark(w.series.map((p) => p.v))}</td>
+  </tr>`).join("");
+
+
+  const maxRank = Math.max.apply(null, [10].concat(doc.works.flatMap((w) => w.series.map((p) => p.v))));
+  return `
+    <div class="panel">
+      <h2>クール別ランキング <span class="tag">視聴数の順位</span>
+        <button class="viewtog" type="button" data-view="season"
+                aria-pressed="${VIEW.season ? "true" : "false"}"
+                title="表と順位の時間変化を切り替える">${VIEW.season ? "表にもどす" : "時間変化"}</button>
+        <span class="hint">${AD.esc(doc.label)} · ${AD.esc(doc.day)} 時点 · 日・週の視聴数は非公開</span></h2>
+      ${VIEW.season ? AD.lineChart(
+          doc.works.filter((w) => w.series.length)
+            .map((w) => ({ name: w.cour_name || w.title, points: w.series })),
+          { invert: true, h: 340, floor: 1, ceil: maxRank, fmt: (v) => AD.int(Math.round(v)) + " 位" })
+        : ""}
+      ${doc.works.length && !VIEW.season ? `<table><thead><tr>
+        <th class="rank" title="最新の視聴数の順位（全作品の中で）">#</th><th>作品</th>
+        <th class="num">前日比</th>
+        <th class="num" title="このクールの期間（${AD.esc((doc.window || [])[0] || "")} 〜 ${AD.esc((doc.window || [])[1] || "")}）の観測日の平均">平均順位</th>
+        <th class="num hide-sm" title="このクールの期間の最高位">最高位</th>
+        <th class="num" title="直近 12 か月の視聴数。dアニメストアが数字を出している唯一の場所で、月に 1 回（1 日）しか更新されない。当季の作品なら「配信開始からの累計」とほぼ同じ">視聴数（年間）</th>
+        <th class="num" title="作品ページの「気になる数」。総数">気になる数</th>
+        <th class="num hide-sm">前回比</th>
+        <th class="num hide-sm" title="API の myListCount。作品ページには出ていない。総数">マイリスト</th>
+        <th class="num hide-sm">前回比</th>
+        <th class="hide-sm">推移</th>
+      </tr></thead><tbody>${rows}</tbody></table>` : ""}
+      ${doc.works.length ? "" : `<div class="empty">このクールに結んだ作品はまだ無い。</div>`}
+      <div class="empty" style="padding:12px 16px;text-align:left">
+        # は最新の<b>視聴数の順位</b>（配信中の全作品の中で。作品ページに「視聴数（総合）」と書いてある順位）。
+        毎日取るのは上位 2000 まで（全作品は週 1 回）なので、— はその日 2000 位より下。
+        平均順位はこのクールの期間の観測日だけで取る。気になる数・マイリストは累計で、前回比は前回の観測日との差。
+        <br><b>視聴数（年間）</b>は直近 12 か月の視聴数で、dアニメストアが数字を出している唯一の場所。
+        <b>月に 1 回（1 日）しか更新されない</b>ので、表の並び（日の順位）とは動く速さが違う。
+        当季の作品は 12 か月の窓に丸ごと収まるため、この数は<b>配信開始からの累計とほぼ同じ</b>
+        （実測でも当季の作品は「年間」と「全期間」が完全に一致する）。
+      </div>
+    </div>`;
+}
+
+/** dアニメストアの 6 つの順位表（上位 50）。表をボタンで切り替える。 */
+/* ---- U-NEXT（順位＋星の評価）---------------------------------------
+ *
+ * U-NEXT は視聴数もお気に入り数も出していない。取れるのはクールの名簿に付く**星の評価**
+ * （0.5 刻み）と、アニメの人気順位 20 位まで（docs/unext.md）。20 位の外は「圏外」。
+ */
+function stars(v) {
+  if (v == null) return '<span class="dim">—</span>';
+  const full = Math.floor(v), half = v - full >= 0.5;
+  return `<span title="${v.toFixed(1)}">${"★".repeat(full)}${half ? "☆" : ""}` +
+         `<span class="dim">${v.toFixed(1)}</span></span>`;
+}
+
+function renderRankRateSeason(doc) {
+  // 順位の天井。U-NEXT は 20 位までしか出ないが、Amazon は栏の件数ぶんある。
+  // 推移の図を 20 で固定すると Amazon の 300 位が全部同じ高さに潰れる。
+  const ceil = Math.max(20, ...doc.works.map((w) => w.rank || 0));
+  const rows = doc.works.map((w, i) => `<tr>
+    <td class="rank">${w.rank == null ? '<span class="dim">圏外</span>' : w.rank}</td>
+    <td class="title-cell">
+      <a href="work.html?id=${w.work_id}&p=${AD.esc(PLATFORM)}&s=${AD.esc(SEASON)}"
+         >${AD.esc(w.cour_name || w.title)}</a>
+      <span class="meta"><span class="pill ${AD.esc(w.match)}">${AD.esc(w.match)}</span>${
+        (w.seasons && w.seasons.length > 1) ? `<span class="pill" style="color:var(--cyan)"
+          title="${AD.esc(w.seasons.join(" / "))} にまたがる作品。順位も評価も作品に 1 つ"
+          >${w.seasons.length}クール作品・${w.cour_index}クール目</span>` : ""}</span>
+    </td>
+    <td class="num">${w.move == null ? '<span class="dim">—</span>' : AD.move(w.move, w.prev)}</td>
+    <td class="num" title="このクールで 20 位に入った ${w.avg_days} 日の平均">${w.avg == null ? "—" : w.avg}</td>
+    <td class="num hide-sm">${w.best == null ? "—" : w.best}</td>
+    <td class="num">${stars(w.rate)}</td>
+    <td class="num hide-sm">${w.rate_delta ? AD.signed(w.rate_delta) : '<span class="dim">—</span>'}</td>${
+    doc.has_count ? `
+    <td class="num">${AD.int(w.count)}</td>
+    <td class="num hide-sm">${AD.signed(w.count_delta)}</td>` : ""}
+    <td class="hide-sm" style="width:80px">${AD.rankSpark(w.series.map((p) => p.v), ceil)}</td>
+  </tr>`).join("");
+
+
+  const ranked = doc.works.filter((w) => w.series.length);
+  return `
+    <div class="panel">
+      <h2>クール別ランキング <span class="tag">${doc.has_count
+          ? AD.esc(doc.rank_chart || "並び順") : "人気順位（20 位まで）"}</span>
+        <button class="viewtog" type="button" data-view="season"
+                aria-pressed="${VIEW.season ? "true" : "false"}"
+                title="表と順位の時間変化を切り替える">${VIEW.season ? "表にもどす" : "時間変化"}</button>
+        <span class="hint">${AD.esc(doc.label)} · ${AD.esc(doc.day)} 時点 · 視聴数は非公開</span></h2>
+      ${VIEW.season ? AD.lineChart(
+          ranked.map((w) => ({ name: w.cour_name || w.title, points: w.series })),
+          { invert: true, h: 320, floor: 1, ceil, fmt: (v) => Math.round(v) + " 位" })
+        : ""}
+      ${doc.works.length && !VIEW.season ? `<table><thead><tr>
+        <th class="rank" title="${doc.has_count
+          ? AD.esc((doc.rank_chart || "") + " に並んでいる順位")
+          : "最新の U-NEXT アニメランキング（20 位まで）"}">#</th><th>作品</th>
+        <th class="num">前日比</th>
+        <th class="num" title="このクールの期間（${AD.esc((doc.window || [])[0] || "")} 〜 ${AD.esc((doc.window || [])[1] || "")}）に 20 位に入った日の平均">平均順位</th>
+        <th class="num hide-sm">最高位</th>
+        <th class="num" title="星の評価">評価</th>
+        <th class="num hide-sm">変化</th>${doc.has_count ? `
+        <th class="num" title="その評価が何件の投稿から出ているか。累計">評価数</th>
+        <th class="num hide-sm">前回比</th>` : ""}
+        <th class="hide-sm">推移</th>
+      </tr></thead><tbody>${rows}</tbody></table>` : ""}
+      ${doc.works.length ? "" : `<div class="empty">このクールのデータはまだ無い。</div>`}
+      <div class="empty" style="padding:12px 16px;text-align:left">${doc.has_count ? `
+        Amazon が出しているのは<b>星の評価</b>（0.1 刻み）と<b>評価数</b>だけで、視聴数もお気に入り数も公開していない。
+        <b>#</b> は <code>${AD.esc(doc.rank_chart || "")}</code> に並んでいる順位で、この表もその順。
+        Amazon 自身は「ランキング」とは呼んでいない（栏の既定の並びが人気順になっている）。
+        ここに出るのは Bangumi に結んでこのクールに属する作品だけなので、番号は飛ぶ。
+        その栏に出てこない作品は「圏外」で末尾。評価数は累計なので、前回比が「その間に何件増えたか」。`
+      : `
+        U-NEXT が出しているのは人気順位 20 位までと星の評価だけで、視聴数・お気に入り数は公開していない。
+        20 位の外の日は記録が無いので「圏外」。評価は 0.5 刻みで、ほとんどの日は動かない。`}
+      </div>
+    </div>`;
+}
+
+/* ---- Hulu（順位だけ）------------------------------------------------
+ *
+ * Hulu は**数字を一つも出していない**。取れるのは順位だけで、絞り込み（TVアニメ／
+ * アニメ映画）× 周期（日・週・月）の 6 表（docs/hulu.md）。クール別ランキングに
+ * 使うのは **TVアニメ デイリー**だけ（export_hulu.RANK_CHART）。
+ *
+ * 数字が無いぶん「圏外」の意味が重い —— 上位 doc.depth の外に落ちた日は
+ * 記録そのものが無い。0 位でも最下位でもなく、**分からない**。
+ *
+ * FOD も同じ形で描く。**表の下の説明だけ**書き出しが doc.note で渡す（信頼できる
+ * 自前の文。HTML のまま入れる）—— FOD は放送中の一覧を全部取るので、「圏外」は
+ * 「分からない」ではなく「一覧に居なかった」になる（docs/fod.md §5）。
+ */
+function renderRankOnlySeason(doc) {
+  const ceil = Math.max(20, ...doc.works.map((w) => w.rank || 0));
+  const win = doc.window || [];
+  const rows = doc.works.map((w) => `<tr>
+    <td class="rank">${w.rank == null ? '<span class="dim">圏外</span>' : w.rank}</td>
+    <td class="title-cell">
+      <a href="work.html?id=${w.work_id}&p=${AD.esc(PLATFORM)}&s=${AD.esc(SEASON)}"
+         >${AD.esc(w.cour_name || w.title)}</a>
+      <span class="meta"><span class="pill ${AD.esc(w.match)}">${AD.esc(w.match)}</span>${
+        (w.seasons && w.seasons.length > 1) ? `<span class="pill" style="color:var(--cyan)"
+          title="${AD.esc(w.seasons.join(" / "))} にまたがる作品。順位は作品に 1 つ"
+          >${w.seasons.length}クール作品・${w.cour_index}クール目</span>` : ""}</span>
+    </td>
+    <td class="num">${w.move == null ? '<span class="dim">—</span>' : AD.move(w.move, w.prev)}</td>
+    <td class="num" title="このクールで順位の付いた ${w.avg_days} 日の平均">${w.avg == null ? "—" : w.avg}</td>
+    <td class="num hide-sm">${w.best == null ? "—" : w.best}</td>
+    <td class="hide-sm" style="width:80px">${AD.rankSpark(w.series.map((p) => p.v), ceil)}</td>
+  </tr>`).join("");
+
+  const ranked = doc.works.filter((w) => w.series.length);
+  return `
+    <div class="panel">
+      <h2>クール別ランキング <span class="tag">${AD.esc(doc.rank_chart || "順位")}</span>
+        <button class="viewtog" type="button" data-view="season"
+                aria-pressed="${VIEW.season ? "true" : "false"}"
+                title="表と順位の時間変化を切り替える">${VIEW.season ? "表にもどす" : "時間変化"}</button>
+        <span class="hint">${AD.esc(doc.label)} · ${AD.esc(doc.day)} 時点 · 視聴数は非公開</span></h2>
+      ${VIEW.season ? AD.lineChart(
+          ranked.map((w) => ({ name: w.cour_name || w.title, points: w.series })),
+          { invert: true, h: 320, floor: 1, ceil, fmt: (v) => Math.round(v) + " 位" })
+        : ""}
+      ${doc.works.length && !VIEW.season ? `<table><thead><tr>
+        <th class="rank" title="${AD.esc(doc.rank_chart || "")} での順位">#</th><th>作品</th>
+        <th class="num">前日比</th>
+        <th class="num" title="このクールの期間（${AD.esc(win[0] || "")} 〜 ${AD.esc(win[1] || "")}）に順位の付いた日の平均">平均順位</th>
+        <th class="num hide-sm">最高位</th>
+        <th class="hide-sm">推移</th>
+      </tr></thead><tbody>${rows}</tbody></table>` : ""}
+      ${doc.works.length ? "" : `<div class="empty">このクールのデータはまだ無い。</div>`}
+      <div class="empty" style="padding:12px 16px;text-align:left">${doc.note ? doc.note : `
+        Hulu が出しているのは<b>順位だけ</b>で、視聴数もお気に入り数も評価も公開していない。
+        <b>#</b> は <code>${AD.esc(doc.rank_chart || "")}</code> での順位で、この表もその順。
+        上位 ${doc.depth || ""} の外に落ちた日は<b>記録が無い</b>（「圏外」）—— 0 位でも最下位でもなく、分からない。`}
+      </div>
+    </div>`;
+}
+
+/**
+ * 切り替え式の順位表。**ボタンで表を選ぶ**形の板块はこれ 1 つで描く
+ * （`kind: "chart_switch"`。いまは dアニメストア と Hulu）。
+ *
+ * 表が多い平台では、軸が 2 つあることがある：
+ *   dアニメ … 指標（視聴数・気になる数・コンプリート）× 期間（日・週）。束は作らない
+ *   Hulu   … 絞り込み（TVアニメ・アニメ映画）× 期間（日・週・月）。**絞り込みで束ねる**
+ *
+ * なので書き出し側は 2 つの形を渡せる。**束が無ければ全部で 1 つの束**として描く：
+ *   {charts: [...]}                      … 板块 1 つ・ボタンが表の数だけ
+ *   {groups: [{id, name, charts: [...]}]} … 束ごとに板块 1 つ・ボタンは束の中だけ
+ *
+ * Hulu が束ねるのは、TVアニメ（全 1896）と アニメ映画（全 666）で**母数が違う**から。
+ * 同じ「1 位」を並べると重みが違うものを並べたことになる（docs/hulu.md §5）。
+ */
+function renderChartSwitch(mod, data) {
+  // 束が無い平台は「名前の無い束が 1 つ」として扱う。ここを揃えれば下は共通
+  const groups = data.groups || [{ id: "_", name: mod.name, charts: data.charts || [] }];
+  return groups.map((g) => {
+    const key = mod.id + ":" + g.id;
+    const cur = g.charts.find((c) => c.id === CHARTSEL[key]) || g.charts[0];
+    if (!cur) return "";
+    CHARTSEL[key] = cur.id;
+    const snaps = cur.snapshots || [];
+    const snap = snaps[snaps.length - 1];
+    if (!snap) return "";
+    const multi = snaps.length > 1;
+
+    // 各作品の順位の軌跡（スパークライン用）
+    const traj = {};
+    snaps.forEach((sn) => sn.items.forEach((i) => {
+      (traj[i.platform_id] = traj[i.platform_id] || []).push(i.rank);
+    }));
+    const maxRank = Math.max.apply(null, snap.items.map((i) => i.rank));
+
+    const rows = snap.items.map((it) => `<tr>
+      <td class="rank">${it.rank}</td>
+      <td class="title-cell">${it.work_id
+        ? `<a href="work.html?id=${it.work_id}&p=${AD.esc(PLATFORM)}" title="Bangumi に結んだ作品">◆ ${AD.esc(it.title)}</a>`
+        : AD.esc(it.title)}<span class="meta">${AD.esc(it.platform_id)}</span></td>
+      ${g.value_label ? `<td class="num">${it.note == null ? '<span class="dim">—</span>' : AD.int(+it.note)}</td>` : ""}
+      <td class="num">${multi ? AD.move(it.move, it.prev) : '<span class="dim">—</span>'}</td>
+      <td class="hide-sm" style="width:80px">${AD.rankSpark(traj[it.platform_id], maxRank)}</td>
+    </tr>`).join("");
+
+    // 表の選び方。`axes` があれば**2 つのボタン列**（バンダイチャンネル：区分 × 期間）。
+    // 押した先は「もう片方の軸は今のまま」の表。その組み合わせが無ければ、その値を持つ最初の表。
+    const buttons = (list) => list.map(([label, target, on]) => `<button class="plat" type="button"
+         data-chartsel="${AD.esc(target)}" data-chartkey="${AD.esc(key)}"
+         aria-selected="${String(on)}">${AD.esc(label)}</button>`).join("");
+    let picker = "";
+    if (g.axes && cur.axes) {
+      picker = g.axes.map((axisName, ax) => {
+        const vals = [...new Set(g.charts.map((c) => c.axes[ax]))];
+        return `<div class="bar" style="padding:6px 16px;margin:0"><span class="hint" style="margin-right:8px">${
+          AD.esc(axisName)}</span>${buttons(vals.map((v) => {
+            const t = g.charts.find((c) => c.axes[ax] === v && c.axes.every((x, i) => i === ax || x === cur.axes[i]))
+              || g.charts.find((c) => c.axes[ax] === v);
+            return [v, t.id, v === cur.axes[ax]];
+          }))}</div>`;
+      }).join("");
+    } else if (g.charts.length > 1) {
+      picker = `<div class="bar" style="padding:10px 16px;margin:0">${
+        buttons(g.charts.map((c) => [c.name || c.chart, c.id, c.id === cur.id]))}</div>`;
+    }
+
+    return `<div class="panel">
+      <h2>${AD.esc(g.name || mod.name)} <span class="tag">${AD.esc(platName())} 独自</span>
+        <span class="hint">${mod.subtitle ? AD.esc(mod.subtitle) + " · " : ""}${
+          AD.esc(snap.day)} 取得 · ${
+          data.top ? "上位 " + data.top : snap.items.length + " 件"} · 記録 ${snaps.length} 日分</span></h2>
+      ${g.desc ? `<div class="empty" style="padding:8px 16px 0;text-align:left">${AD.esc(g.desc)}</div>` : ""}
+      ${picker}
+      <table><thead><tr><th class="rank">#</th><th>${AD.esc(cur.chart)}</th>
+        ${g.value_label ? `<th class="num">${AD.esc(g.value_label)}</th>` : ""}
+        <th class="num">前回比</th><th class="hide-sm">推移</th></tr></thead>
+        <tbody>${rows}</tbody></table>
+      <div class="empty" style="padding:12px 16px;text-align:left">${AD.esc(mod.note || "")}</div>
+    </div>`;
+  }).join("");
+}
+
+/* ---- Lemino（順位＋お気に入り・評価）---------------------------------
+ *
+ * Lemino は再生数を公開していない（並べる順にだけ使っている）。並びは日・月の 2 つで、
+ * 作品ごとにお気に入りの数・感想の数・星の平均を出している（docs/lemino.md）。
+ * クール別ランキングは**日の再生数の順位**。上位 doc.depth の外は「圏外」。
+ */
+function renderRankFavSeason(doc) {
+  const ceil = Math.max(20, ...doc.works.flatMap((w) => w.series.map((p) => p.v || 0)));
+  const win = doc.window || [];
+  const rows = doc.works.map((w) => `<tr>
+    <td class="rank">${w.rank == null ? '<span class="dim">圏外</span>' : w.rank}</td>
+    <td class="title-cell">
+      <a href="work.html?id=${w.work_id}&p=${AD.esc(PLATFORM)}&s=${AD.esc(SEASON)}"
+         >${AD.esc(w.cour_name || w.title)}</a>
+      <span class="meta"><span class="pill ${AD.esc(w.match)}">${AD.esc(w.match)}</span>${
+        (w.seasons && w.seasons.length > 1) ? `<span class="pill" style="color:var(--cyan)"
+          title="${AD.esc(w.seasons.join(" / "))} にまたがる作品。順位・お気に入りは作品に 1 つ"
+          >${w.seasons.length}クール作品・${w.cour_index}クール目</span>` : ""}</span>
+    </td>
+    <td class="num">${w.move == null ? '<span class="dim">—</span>' : AD.move(w.move, w.prev)}</td>
+    <td class="num" title="このクールで順位の付いた ${w.avg_days} 日の平均">${w.avg == null ? "—" : w.avg}</td>
+    <td class="num hide-sm">${w.best == null ? "—" : w.best}</td>
+    <td class="num hide-sm">${w.month_rank == null ? '<span class="dim">—</span>' : w.month_rank}</td>
+    <td class="num">${AD.int(w.fav)}</td>
+    <td class="num hide-sm">${AD.signed(w.fav_delta)}</td>
+    <td class="num">${w.rating == null ? '<span class="dim">—</span>' : "★" + w.rating.toFixed(1)}</td>
+    <td class="num hide-sm">${AD.int(w.reviews)}</td>
+    <td class="hide-sm" style="width:80px">${AD.rankSpark(w.series.map((p) => p.v), ceil)}</td>
+  </tr>`).join("");
+  const ranked = doc.works.filter((w) => w.series.length);
+  return `
+    <div class="panel">
+      <h2>クール別ランキング <span class="tag">${AD.esc(doc.rank_chart || "順位")}</span>
+        <button class="viewtog" type="button" data-view="season"
+                aria-pressed="${VIEW.season ? "true" : "false"}"
+                title="表と順位の時間変化を切り替える">${VIEW.season ? "表にもどす" : "時間変化"}</button>
+        <span class="hint">${AD.esc(doc.label)} · ${AD.esc(doc.day)} 時点 · 再生数は非公開</span></h2>
+      ${VIEW.season ? AD.lineChart(
+          ranked.map((w) => ({ name: w.cour_name || w.title, points: w.series })),
+          { invert: true, h: 320, floor: 1, ceil, fmt: (v) => Math.round(v) + " 位" })
+        : ""}
+      ${doc.works.length && !VIEW.season ? `<table><thead><tr>
+        <th class="rank" title="${AD.esc(doc.rank_chart || "")} での順位（アニメ全作品の中で）">#</th><th>作品</th>
+        <th class="num">前日比</th>
+        <th class="num" title="このクールの期間（${AD.esc(win[0] || "")} 〜 ${AD.esc(win[1] || "")}）に順位の付いた日の平均">平均順位</th>
+        <th class="num hide-sm">最高位</th>
+        <th class="num hide-sm" title="${AD.esc(doc.month_chart || "")} での順位">月の順位</th>
+        <th class="num" title="お気に入りの数。累計">お気に入り</th>
+        <th class="num hide-sm">前回比</th>
+        <th class="num" title="感想に付いた星の平均">評価</th>
+        <th class="num hide-sm" title="感想の数。累計">感想</th>
+        <th class="hide-sm">推移</th>
+      </tr></thead><tbody>${rows}</tbody></table>` : ""}
+      ${doc.works.length ? "" : `<div class="empty">このクールのデータはまだ無い。</div>`}
+      <div class="empty" style="padding:12px 16px;text-align:left">
+        # は <code>${AD.esc(doc.rank_chart || "")}</code> での順位（Lemino が<b>日の再生数の多い順</b>に並べたもの。
+        再生数そのものは公開していない）。上位 ${doc.depth || ""} の外に落ちた日は<b>記録が無い</b>（「圏外」）。
+        お気に入り・感想の数・評価は Lemino が出している数字で、前回比は前回の観測日との差。
+      </div>
+    </div>`;
+}
+
+/* ---- バンダイチャンネル（順位＋再生回数・お気に入り数）--------------------
+ *
+ * 表は上位 30 まで、並びと一緒に数字（cnt）が付く（docs/bandai.md）。
+ * クール別ランキングは**再生回数・放送連動・日**の順。数字はその日の表の上位 30 に居たときだけ。
+ */
+function renderRankPlaySeason(doc) {
+  const ceil = Math.max(20, ...doc.works.flatMap((w) => w.series.map((p) => p.v || 0)));
+  const win = doc.window || [];
+  const n = (v) => (v == null ? '<span class="dim">—</span>' : AD.int(v));
+  const rows = doc.works.map((w) => `<tr>
+    <td class="rank">${w.pos == null ? '<span class="dim">—</span>' : w.pos}</td>
+    <td class="title-cell">
+      <a href="work.html?id=${w.work_id}&p=${AD.esc(PLATFORM)}&s=${AD.esc(SEASON)}"
+         >${AD.esc(w.cour_name || w.title)}</a>
+      <span class="meta"><span class="pill ${AD.esc(w.match)}">${AD.esc(w.match)}</span></span>
+    </td>
+    <td class="num"><b>${n(w.play_cour)}</b></td>
+    <td class="num">${w.rank == null ? '<span class="dim">圏外</span>' : w.rank}</td>
+    <td class="num">${w.move == null ? '<span class="dim">—</span>' : AD.move(w.move, w.prev)}</td>
+    <td class="num" title="このクールで順位の付いた ${w.avg_days} 日の平均">${w.avg == null ? "—" : w.avg}</td>
+    <td class="num hide-sm">${w.best == null ? "—" : w.best}</td>
+    <td class="num">${n(w.play_daily)}</td>
+    <td class="num hide-sm">${n(w.play_weekly)}</td>
+    <td class="num hide-sm">${n(w.play_monthly)}</td>
+    <td class="num hide-sm">${n(w.favorite_total)}</td>
+    <td class="hide-sm" style="width:80px">${AD.rankSpark(w.series.map((p) => p.v), ceil)}</td>
+  </tr>`).join("");
+  const ranked = doc.works.filter((w) => w.series.length);
+  return `
+    <div class="panel">
+      <h2>クール別ランキング <span class="tag">${AD.esc(doc.rank_chart || "順位")}</span>
+        <button class="viewtog" type="button" data-view="season"
+                aria-pressed="${VIEW.season ? "true" : "false"}"
+                title="表と順位の時間変化を切り替える">${VIEW.season ? "表にもどす" : "時間変化"}</button>
+        <span class="hint">${AD.esc(doc.label)} · ${AD.esc(doc.day)} 時点</span></h2>
+      ${VIEW.season ? AD.lineChart(
+          ranked.map((w) => ({ name: w.cour_name || w.title, points: w.series })),
+          { invert: true, h: 320, floor: 1, ceil, fmt: (v) => Math.round(v) + " 位" })
+        : ""}
+      ${doc.works.length && !VIEW.season ? `<table><thead><tr>
+        <th class="rank" title="このクールの再生回数の累計の順">#</th><th>作品</th>
+        <th class="num" title="このクールの期間の再生回数。「月」の値の前回との差を足したもの">累計</th>
+        <th class="num" title="${AD.esc(doc.rank_chart || "")} での順位">日の順位</th>
+        <th class="num">前日比</th>
+        <th class="num" title="このクールの期間（${AD.esc(win[0] || "")} 〜 ${AD.esc(win[1] || "")}）に順位の付いた日の平均">平均順位</th>
+        <th class="num hide-sm">最高位</th>
+        <th class="num" title="再生回数（日）">再生・日</th>
+        <th class="num hide-sm" title="再生回数（週）">再生・週</th>
+        <th class="num hide-sm" title="再生回数（月）">再生・月</th>
+        <th class="num hide-sm" title="お気に入り数（全期間）">お気に入り</th>
+        <th class="hide-sm">推移</th>
+      </tr></thead><tbody>${rows}</tbody></table>` : ""}
+      ${doc.works.length ? "" : `<div class="empty">このクールのデータはまだ無い。</div>`}
+      <div class="empty" style="padding:12px 16px;text-align:left">
+        再生回数：「${AD.esc(doc.desc || "")}」（BANDAI CH の説明）。
+        表は<b>このクールの再生回数の累計</b>の順（#）。日の順位は <code>${AD.esc(doc.rank_chart || "")}</code> での順位。
+        どの表も<b>上位 ${doc.depth || ""} まで</b>しか出ていないので、外に落ちた日は順位も数字も無い（—・圏外）。
+        <br><b>累計</b>はこのクールの期間の再生回数。「日」は<b>その日 0 時からの途中の数</b>なので足さず、
+        「月」（その月 1 日からの数）の<b>前回との差</b>を足している（月が変わった日はその日の値）。
+        月の上位 30 に入った日が無い作品には付かず、表の後ろに日の順位の順で並ぶ。
+      </div>
+    </div>`;
+}
+
+function renderSeason(doc) {
+  if (doc.kind === "favorite") return renderFavoriteSeason(doc);
+  if (doc.kind === "rank_rate") return renderRankRateSeason(doc);
+  if (doc.kind === "rank_count") return renderRankCountSeason(doc);
+  if (doc.kind === "rank_only") return renderRankOnlySeason(doc);
+  if (doc.kind === "rank_fav") return renderRankFavSeason(doc);
+  if (doc.kind === "rank_play") return renderRankPlaySeason(doc);
+  if (doc.kind === "weekly_rank") return renderWeeklySeason(doc);
+  const rows = doc.works.map((w) => rankRow(w, doc.has_engagement)).join("");
+
+  return `
+    <div class="panel">
+      <h2>クール別ランキング <span class="tag">${metricName()}</span>
+        <button class="viewtog" type="button" data-view="season"
+                aria-pressed="${VIEW.season ? "true" : "false"}"
+                title="表と時間変化の図を切り替える">${VIEW.season ? "表にもどす" : "時間変化"}</button>
+        <span class="hint">${AD.esc(doc.label)} · 本編のみ · ${AD.esc(doc.day)} 時点</span></h2>
+      ${VIEW.season ? AD.lineChart(
+          doc.works.filter((w) => (w.history || []).length)
+            .map((w) => ({ name: w.title, points: w.history })),
+          { fmt: (v) => AD.man(v), floor: 0 })
+        : ""}
+      ${doc.works.length && !VIEW.season ? `<table><thead><tr>
+        <th class="rank">#</th><th>作品</th>
+        <th class="num">累計${metricName()}</th>
+        <th class="num hide-sm">話</th>
+        <th class="num hide-sm">第1話</th>
+        <th class="num hide-sm">継続率</th>
+        <th class="num">直近の増加</th>${doc.has_engagement ? `
+        <th class="num" title="本編に付いたコメント（弾幕）の累計。niconico ではコメントと弾幕は同じもの">コメント数</th>
+        <th class="num hide-sm">前回比</th>
+        <th class="num hide-sm" title="マイリストに入れられた数。累計">マイリスト</th>
+        <th class="num hide-sm">前回比</th>` : ""}
+        <th class="hide-sm">推移</th>
+      </tr></thead><tbody>${rows}</tbody></table>`
+      : (doc.works.length ? "" : `<div class="empty">このクールのデータはまだ無い。</div>`)}
+    </div>`;
+}
+
+/** 平台独自の板块。kind ごとに描き方を分ける（平台名では分けない）。 */
+function renderModule(mod, data) {
+  if (!data) return "";
+  if (mod.kind === "chart_snapshot") return renderChartSnapshot(mod, data);
+  if (mod.kind === "chart_switch") return renderChartSwitch(mod, data);
+  return "";
+}
+
+/** ABEMA の週間ランキング（平台が自分で出している順位）。 */
+function renderChartSnapshot(mod, data) {
+  return (data.charts || []).map((c) => {
+    const snaps = c.snapshots || [];
+    const cur = snaps[snaps.length - 1];
+    if (!cur) return "";
+
+    // 各作品の順位の軌跡。これがこのモジュールの主役 ——
+    // ABEMA が自分で出している順位が日ごとにどう動くか。
+    const traj = {};
+    snaps.forEach((s) => s.items.forEach((i) => {
+      (traj[i.platform_id] = traj[i.platform_id] || []).push(i.rank);
+    }));
+    const maxRank = Math.max.apply(null, cur.items.map((i) => i.rank));
+    const multi = snaps.length > 1;
+
+    const rows = cur.items.map((it) => `<tr>
+      <td class="rank">${it.rank}</td>
+      <td class="title-cell">${AD.esc(it.title)}${
+        it.note ? `<span class="dim">（${AD.esc(it.note)}）</span>` : ""}
+        <span class="meta">${AD.esc(it.platform_id)}</span></td>
+      <td class="num">${multi ? AD.move(it.move, it.prev) : '<span class="dim">—</span>'}</td>
+      <td class="hide-sm" style="width:80px">${
+        AD.rankSpark(traj[it.platform_id], maxRank)}</td>
+    </tr>`).join("");
+
+    // 順位の時間変化。小さいほど上なので y を反転する。
+    const rankSeries = cur.items.map((it) => ({
+      name: it.title,
+      points: snaps.map((sn) => {
+        const hit = (sn.items || []).find((i) => i.platform_id === it.platform_id);
+        return hit ? { d: sn.day, v: hit.rank } : null;
+      }).filter(Boolean),
+    }));
+
+    return `<div class="panel">
+      <h2>${AD.esc(c.chart)} <span class="tag">${AD.esc(platName())} 独自</span>
+        <button class="viewtog" type="button" data-view="rank"
+                aria-pressed="${VIEW.rank ? "true" : "false"}"
+                title="表と順位の時間変化を切り替える">${VIEW.rank ? "表にもどす" : "時間変化"}</button>
+        <span class="hint">${AD.esc(cur.day)} 取得 · ${cur.items.length} 位 · 記録 ${snaps.length} 日分</span></h2>
+      ${VIEW.rank ? AD.lineChart(rankSeries, {
+          invert: true, h: 320, floor: 1, ceil: maxRank,
+          fmt: (v) => Math.round(v) + " 位" })
+        : `<table><thead><tr>
+        <th class="rank">#</th><th>作品</th>
+        <th class="num">前日比</th>
+        <th class="hide-sm">推移</th>
+      </tr></thead><tbody>${rows}</tbody></table>`}
+      <div class="empty" style="padding:12px 16px;text-align:left">
+        ${AD.esc(mod.note || "")}${multi ? "" :
+          "<br>まだ 1 日分しか無いので変動は出せない。日を重ねるほどこの列が主役になる。"}
+      </div>
+    </div>`;
+  }).join("");
+}
+
+async function loadPlatform(pid) {
+  PLATFORM = pid;
+  const p = INDEX.platforms.find((x) => x.id === pid);
+  AD.platTabs(INDEX.platforms, pid, loadPlatform);
+  document.getElementById("platnote").textContent = p.note || "";
+
+  const sel = document.getElementById("season");
+  sel.innerHTML = p.seasons.map((s) =>
+    `<option value="${AD.esc(s.key)}">${AD.esc(s.label)}（${s.works}作品）</option>`).join("");
+  if (!p.seasons.length) {
+    document.getElementById("body").innerHTML =
+      `<div class="panel"><div class="empty">${AD.esc(p.name)} はまだ未対応。</div></div>`;
+    return;
+  }
+  // 既定は「配信中」。前は配列の末尾を取っていて、クール名の並び順しだいで
+  // 2026-winter が既定になっていた。見たいのはほぼ常に配信中なので明示する。
+  const fallback = (p.seasons.find((s) => s.current) || p.seasons[p.seasons.length - 1]).key;
+  SEASON = p.seasons.some((s) => s.key === SEASON) ? SEASON : fallback;
+  sel.value = SEASON;
+  sel.onchange = () => { SEASON = sel.value; loadSeason(p); };
+  await loadSeason(p);
+}
+
+async function loadSeason(p) {
+  setUrl();
+  const body = document.getElementById("body");
+  body.innerHTML = `<div class="panel"><div class="empty">読み込み中…</div></div>`;
+  const meta = p.seasons.find((s) => s.key === SEASON);
+  try {
+    const doc = await AD.json("data/" + meta.file);
+    // プラットフォーム独自の板块（ABEMA の週間ランキング等）を後ろに積む
+    const mods = [];
+    for (const mod of (p.modules || [])) {
+      if (!mod.file) continue;
+      try { mods.push([mod, await AD.json("data/" + mod.file)]); }
+      catch (_) { /* その板块だけ落ちても全体は出す */ }
+    }
+    // 取ってきたものは控えておく。表と図の切り替えで取り直さないため。
+    LAST.doc = doc;
+    LAST.mods = mods;
+    paint();
+  } catch (e) {
+    body.innerHTML = `<div class="panel"><div class="empty">
+      データが読めなかった（${AD.esc(e.message)}）。<br><br>
+      <code>python tools/ingest.py</code> → <code>python tools/export_site.py</code>
+      を走らせて、<code>site/</code> をローカルサーバで開いているか確認。
+    </div></div>`;
+  }
+}
+
+// 表と図の切り替え。状態はページの中だけ —— 保存はしない（URL で共有したい
+// ものでもないし、次に開いたときは表から入る方が素直）。
+const VIEW = { season: false, rank: false };
+const LAST = { doc: null, mods: [] };
+
+/** 控えてある中身から画面を組み直す。切り替えのたびに取り直さない。 */
+function paint() {
+  if (!LAST.doc) return;
+  const p = INDEX.platforms.find((x) => x.id === PLATFORM) || {};
+  let html = renderSeason(LAST.doc);
+  // Netflix の週間 TOP10 は地区ごとのファイル。地区を選んでから読むので loadSeason では読まない
+  for (const mod of (p.modules || [])) {
+    if (mod.kind === "netflix_top10") html += renderNetflixTop10(mod);
+  }
+  for (const [mod, data] of LAST.mods) html += renderModule(mod, data);
+  document.getElementById("body").innerHTML = html;
+}
+
+document.addEventListener("click", (e) => {
+  const rg = e.target.closest && e.target.closest("[data-region]");
+  if (rg) {
+    REGION = rg.dataset.region;
+    TOPWEEK = null;
+    setUrl();
+    paint();
+    return;
+  }
+  const cs = e.target.closest && e.target.closest("[data-chartsel]");
+  if (cs) { CHARTSEL[cs.dataset.chartkey] = cs.dataset.chartsel; paint(); return; }
+  const vt = e.target.closest && e.target.closest("[data-view]");
+  if (vt) {
+    VIEW[vt.dataset.view] = !VIEW[vt.dataset.view];
+    paint();
+    return;
+  }
+});
+
+// 週間 TOP10 の週の選択（Netflix）
+document.addEventListener("change", (e) => {
+  const tw = e.target.closest && e.target.closest("[data-topweek]");
+  if (tw) { TOPWEEK = tw.value; paint(); }
+});
+
+(async () => {
+  document.body.insertAdjacentHTML("afterbegin", AD.defs());
+  await AD.probeLocal();      // 手元なら編集できる、公開版なら読むだけ
+  if (AD.local !== null) {
+    document.getElementById("tools").innerHTML =
+      '<a class="plat" href="maintain.html">メンテナンス</a>';
+  }
+  try {
+    INDEX = await AD.json("data/index.json");
+  } catch (e) {
+    document.getElementById("body").innerHTML = `<div class="panel"><div class="empty">
+      <code>site/data/index.json</code> が無い。<br><br>
+      <code>python tools/export_site.py</code> を先に走らせる。<br>
+      ファイルを直接開くと fetch がブロックされるので、
+      <code>python -m http.server</code> 経由で見ること。
+    </div></div>`;
+    document.getElementById("stamp").textContent = "—";
+    return;
+  }
+  document.getElementById("stamp").textContent =
+    `最終更新 ${INDEX.generated_at.replace("T", " ").slice(0, 16)} · データ最終日 ${INDEX.day}`;
+  SEASON = qs.get("s") || null;
+  await loadPlatform(qs.get("p") || INDEX.default_platform);
+})();
+</script>
+</body>
+</html>

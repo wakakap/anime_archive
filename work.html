@@ -1,0 +1,525 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>作品詳細 — アニメ配信データ</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>🌙</text></svg>">
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body>
+<div class="wrap">
+  <div class="crumb"><a href="index.html" id="back">← ランキングへ戻る</a></div>
+  <div id="head"></div>
+  <div id="body"></div>
+</div>
+
+<script src="assets/app.js"></script>
+<script>
+"use strict";
+const qs = new URLSearchParams(location.search);
+const ID = qs.get("id");
+const PLAT = qs.get("p") || "abema";
+// どの範囲で見るか。クールから来たときはそのクールに絞る（既定）。
+//   cour   … そのクールに放送された話だけ
+//   work   … この作品の全話
+//   series … 同じシリーズの全季を合算
+let SCOPE = qs.get("scope") || (qs.get("s") ? "cour" : "work");
+let SEASON = qs.get("s") || "";
+let WORK = null;
+
+// 戻るリンクは来たときの平台とクールに戻す（?p=&s=）。無いと既定の平台（ABEMA）に戻ってしまう。
+{
+  const back = new URLSearchParams();
+  if (qs.get("p")) back.set("p", qs.get("p"));
+  if (qs.get("s")) back.set("s", qs.get("s"));
+  const q = back.toString();
+  document.getElementById("back").href = "index.html" + (q ? "?" + q : "");
+}
+
+function statCard(k, v, x) {
+  return `<div class="stat"><div class="k">${AD.esc(k)}</div>
+    <div class="v">${v}</div><div class="x">${AD.esc(x || "")}</div></div>`;
+}
+
+/**
+ * 作品コードのカード。**どの平台でも同じ形で出す。**
+ *
+ * 出すのはいつも platform_id。`p.url` があれば押せるようにする ——
+ * Hulu だけは platform_id で URL が作れないので飛び先に slug を使う（見た目は ID のまま）。
+ * Netflix は platform_id が題名そのもので作品のページが無いので、押せない。
+ * URL の作り方は export_site.WORK_URL。
+ */
+function idCard(pid, p) {
+  const ids = Array.isArray(pid) ? pid : [pid];
+  const txt = AD.esc(ids.filter(Boolean).join(" / ")) || "—";
+  const v = p && p.url
+    ? `<a href="${AD.esc(p.url)}" target="_blank" rel="noopener noreferrer"
+         title="${AD.esc(p.url)}">${txt} ↗</a>`
+    : txt;
+  return statCard("作品コード", v, "");
+}
+
+/** その平台のクール一覧。無ければ作品全体のもの（古い書き出し）。 */
+function coursOf(work, p) { return p.cours || work.cours || []; }
+
+// 平台の表示名と指標名。index.json から引く（無ければ ID と「視聴数」）。
+let PLATMETA = {};
+
+function scopeBar(work, p) {
+  const cour = coursOf(work, p).find((c) => c.season === SEASON && c.ep_from != null);
+  const opts = [];
+  if (cour) {
+    opts.push({ k: "cour", label: `${cour.cour_title || AD.esc(SEASON)}（第${cour.ep_from}〜${cour.ep_to}話）`,
+                note: "このクールに放送された分だけ" });
+  }
+  opts.push({ k: "work", label: `この作品の全${p.episodes.length}話`, note: "クールをまたいだ合計" });
+  if ((p.siblings || []).length > 1) {
+    const tot = p.siblings.reduce((a, b) => a + b.eps, 0);
+    opts.push({ k: "series",
+                label: `${AD.esc(p.series_title || "シリーズ")} 全${tot}話`,
+                note: `${p.siblings.length} 季を合算` });
+  }
+  if (!cour && SCOPE === "cour") SCOPE = "work";
+  return `<div class="bar" style="margin:0 0 18px">
+    ${opts.map((o) => `<button class="plat" type="button" data-scope="${o.k}"
+      aria-selected="${String(o.k === SCOPE)}" title="${AD.esc(o.note)}">${o.label}</button>`).join("")}
+  </div>`;
+}
+
+/**
+ * 登録数といいねの平台（p.favorite がある。いまは TVer）。
+ *
+ * 登録数は系列に 1 つ（クールでは割れない）、いいねは話ごと。限定配信で話は消えるので、
+ * 話ごとのいいねは**最後に観測した値**（p.last_seen）を出し、最終日に見えなかった話には
+ * 最後に観測した日を添える。クールの範囲は画面の話数（disp）で切る（export_common.ep_label と同じ）。
+ */
+function renderFavoritePlatform(pid, p, work) {
+  const meta = PLATMETA[pid] || {};
+  const pname = meta.name || pid;
+  const em = (meta.metrics || []).find((m) => m.id === meta.episode_metric) || {};
+  const mname = em.name || "いいね";
+  const f = p.favorite;
+  const label = (e) => (e.disp != null ? e.disp : e.no);
+  const cour = coursOf(work, p).find((c) => c.season === SEASON && c.ep_from != null);
+  const inScope = (e) => SCOPE !== "cour" || !cour ||
+    (label(e) >= cour.ep_from && label(e) <= cour.ep_to);
+  const prev = p.series.length > 1 ? p.series[p.series.length - 2] : null;
+  const items = p.episodes.filter(inScope)
+    .filter((e) => p.last_seen[String(e.no)])
+    .map((e) => {
+      const ls = p.last_seen[String(e.no)];
+      const pv = prev && ls.d === p.day ? prev.v[String(e.no)] : null;
+      return { k: String(label(e)), t: e.title || ("第" + label(e) + "話"),
+               v: ls.v, d: ls.d, live: ls.d === p.day, inc: pv == null ? null : ls.v - pv };
+    });
+  const total = items.reduce((a, b) => a + b.v, 0);
+  const live = items.filter((x) => x.live).length;
+
+  const rows = items.map((e) => `<tr>
+      <td class="rank">${AD.esc(e.k)}</td>
+      <td class="title-cell">${AD.esc(e.t)}${e.live ? "" :
+        `<span class="meta" title="${AD.esc(p.day)} には配信されていなかった。最後に観測した値">配信終了 · 最終観測 ${AD.esc(e.d)}</span>`}</td>
+      <td class="num">${AD.int(e.v)}</td>
+      <td class="num">${AD.signed(e.inc)}</td>
+    </tr>`).join("");
+
+  return `
+    ${scopeBar(work, p)}
+    <div class="stats">
+      ${statCard("登録数", AD.man(f.total), f.total == null ? "系列が情報番組のため採っていない"
+                 : AD.int(f.total) + "（系列 " + f.series_id + "）")}
+      ${statCard("登録数の前回比", f.delta == null ? "—" : AD.signed(f.delta),
+                 f.prev_day ? f.prev_day + " → " + f.day : "比較対象がまだ無い")}
+      ${statCard(mname + "の合計", AD.man(total), "話ごとの最後に観測した値")}
+      ${statCard("話", live + " / " + items.length, "最終日に配信中 / 観測したことのある話")}
+      ${idCard(p.platform_id, p)}
+    </div>
+
+    ${(f.history || []).length ? `<div class="panel">
+      <h2>登録数の推移 <span class="tag">${AD.esc(pname)}</span>
+        <span class="hint">系列 ${AD.esc(f.series_id)} · ${f.history.length} 日分</span></h2>
+      ${AD.lineChart([{ name: work.title, points: f.history }], { fmt: (v) => AD.man(v), floor: 0 })}
+    </div>` : ""}
+
+    <div class="panel">
+      <h2>話ごとの${AD.esc(mname)} <span class="tag">${AD.esc(pname)}</span>
+        <span class="hint">${SCOPE === "cour" && cour
+          ? AD.esc(cour.cour_title || SEASON) + `（第${cour.ep_from}〜${cour.ep_to}話）`
+          : "全話"} · ${AD.esc(p.day)} 時点</span></h2>
+      <div class="chart">${AD.barChart(items)}</div>
+      <table><thead><tr>
+        <th class="rank">話</th><th>サブタイトル</th>
+        <th class="num">${AD.esc(mname)}</th>
+        <th class="num">増加</th>
+      </tr></thead><tbody>${rows}</tbody></table>
+      <div class="empty" style="padding:12px 16px;text-align:left">
+        ${AD.esc(pname)} は限定配信で話が出たり消えたりする。消えた話は最後に観測した値のまま数える。
+        増加は最後の観測とその前の観測の両方がある話だけ。
+      </div>
+    </div>`;
+}
+
+/**
+ * 週間 TOP10 の平台（p.weekly がある。いまは Netflix）。話は無い。
+ *
+ * 地区ごとに：最高位・TOP10 に入った週の数・最新週の順位・期間。グローバルは週の視聴数も。
+ * 数字の単位は週（月〜日。日付は日曜）。他の平台の「日」とは比べない。
+ */
+function renderWeeklyPlatform(pid, p, work) {
+  const meta = PLATMETA[pid] || {};
+  const pname = meta.name || pid;
+  const wk = p.weekly;
+  const recs = wk.records || {};
+  const regs = (wk.regions || []).filter((r) => recs[r.id]);
+  if (!regs.length) {
+    return `<div class="panel"><div class="empty">${AD.esc(pname)} のどの地区でも TOP10 に入っていない。</div></div>`;
+  }
+  const want = new URLSearchParams(location.search).get("r");
+  const focus = regs.find((r) => r.id === want) || regs[0];
+  const g = recs.global;
+  const rows = regs.map((r) => {
+    const x = recs[r.id];
+    return `<tr${r.id === focus.id ? ' style="background:var(--panel-2, rgba(122,162,247,.06))"' : ""}>
+      <td class="title-cell">${AD.esc(r.name)}</td>
+      <td class="num">${x.best} 位</td>
+      <td class="num">${x.weeks}</td>
+      <td class="num">${x.last == null ? '<span class="dim">圏外</span>' : x.last + " 位"}</td>
+      <td class="num hide-sm dim">${AD.esc(x.first)} 〜 ${AD.esc(x.latest)}</td>
+      <td class="hide-sm" style="width:80px">${AD.rankSpark(x.series.map((s) => s.v), 10)}</td>
+    </tr>`;
+  }).join("");
+  const best = Math.min.apply(null, regs.map((r) => recs[r.id].best));
+  return `
+    <div class="stats">
+      ${statCard("最高位", best + " 位", regs.filter((r) => recs[r.id].best === best).map((r) => r.name).join("・"))}
+      ${statCard("TOP10 に入った地区", regs.length + " / " + (wk.regions || []).length, "画面に出している地区のうち")}
+      ${statCard(focus.name + " の TOP10 週", String(recs[focus.id].weeks),
+                 recs[focus.id].first + " 〜 " + recs[focus.id].latest)}
+      ${statCard("グローバルの視聴数", g && g.views != null ? AD.man(g.views) : "—",
+                 g ? "TOP10 に入った " + g.views_weeks + " 週の合計" : "グローバルの TOP10 には入っていない")}
+      ${idCard(wk.platform_ids, p)}
+    </div>
+
+    <div class="panel">
+      <h2>地区ごとの週間 TOP10 <span class="tag">${AD.esc(pname)}</span>
+        <span class="hint">最新週 ${AD.esc(wk.day)} · ${AD.esc(wk.platform_ids.join(" / "))}</span></h2>
+      ${AD.lineChart(regs.map((r) => ({ name: r.name, points: recs[r.id].series })),
+        { invert: true, h: 300, floor: 1, ceil: 10, fmt: (v) => Math.round(v) + " 位" })}
+      <table><thead><tr>
+        <th>地区</th><th class="num">最高位</th><th class="num">TOP10 週</th>
+        <th class="num">最新週</th><th class="num hide-sm">期間</th><th class="hide-sm">推移</th>
+      </tr></thead><tbody>${rows}</tbody></table>
+      <div class="empty" style="padding:12px 16px;text-align:left">
+        国別は順位だけ（Netflix は国ごとの視聴数を公開していない）。単位は週（月〜日）。
+        Netflix の単位は季なので、2 クールにまたがる季はどちらのクールから見ても同じ記録。
+      </div>
+    </div>
+
+    ${g && (g.views_series || []).length ? `<div class="panel">
+      <h2>グローバルの週の視聴数 <span class="tag">${AD.esc(pname)}</span>
+        <span class="hint">TOP10 に入った週だけ（入っていない週は公開されない）</span></h2>
+      ${AD.lineChart([{ name: work.title, points: g.views_series }], { fmt: (v) => AD.man(v), floor: 0 })}
+    </div>` : ""}`;
+}
+
+/**
+ * 視聴数の順位と気になる数・マイリストの平台（p.rankcount がある。いまは dアニメストア）。話は無い。
+ * 順位は全作品の中での視聴数の順位（小さいほど上）。気になる数・マイリストはどちらも累計。
+ */
+function renderRankCountPlatform(pid, p, work) {
+  const meta = PLATMETA[pid] || {};
+  const pname = meta.name || pid;
+  const rc = p.rankcount;
+  const maxRank = Math.max.apply(null, [10].concat(rc.series.map((x) => x.v)));
+  const cours = (rc.cours || []).map((c) => `<tr>
+      <td class="title-cell">${AD.esc(c.label)}</td>
+      <td class="num">${c.avg == null ? "—" : c.avg}</td>
+      <td class="num">${c.best == null ? "—" : c.best + " 位"}</td>
+      <td class="num">${c.avg_days || 0}</td>
+    </tr>`).join("");
+  return `
+    <div class="stats">
+      ${statCard("視聴数の順位", rc.rank == null ? "—" : AD.int(rc.rank) + " 位",
+                 rc.prev == null ? rc.day + " 時点" : "前回 " + AD.int(rc.prev) + " 位 · " + rc.day)}
+      ${statCard("気になる数", AD.man(rc.fav), (rc.fav == null ? "" : AD.int(rc.fav) + " · ") +
+                 (rc.fav_delta == null ? "累計" : "前回比 " + (rc.fav_delta > 0 ? "+" : "") + AD.int(rc.fav_delta)))}
+      ${statCard("マイリスト", AD.man(rc.myl), (rc.myl == null ? "" : AD.int(rc.myl) + " · ") +
+                 (rc.myl_delta == null ? "累計（作品ページには出ていない）"
+                  : "前回比 " + (rc.myl_delta > 0 ? "+" : "") + AD.int(rc.myl_delta)))}
+      ${idCard(rc.platform_ids, p)}
+    </div>
+
+    <div class="panel">
+      <h2>視聴数の順位 <span class="tag">${AD.esc(pname)}</span>
+        <span class="hint">配信中の全作品の中で · ${rc.series.length} 日分</span></h2>
+      ${AD.lineChart([{ name: work.title, points: rc.series }],
+        { invert: true, floor: 1, ceil: maxRank, fmt: (v) => AD.int(Math.round(v)) + " 位" })}
+      ${cours ? `<table><thead><tr><th>クール</th><th class="num">平均順位</th><th class="num">最高位</th>
+        <th class="num">観測日</th></tr></thead><tbody>${cours}</tbody></table>` : ""}
+    </div>
+
+    ${(rc.fav_series.length || rc.myl_series.length) ? `<div class="panel">
+      <h2>気になる数・マイリストの推移 <span class="tag">${AD.esc(pname)}</span>
+        <span class="hint">累計 · 気になる数（作品ページの数字）とマイリスト（API の myListCount）</span></h2>
+      ${AD.lineChart([{ name: "マイリスト", points: rc.myl_series }, { name: "気になる数", points: rc.fav_series }],
+        { fmt: (v) => AD.man(v) })}
+    </div>` : ""}`;
+}
+
+/**
+ * 順位＋星の評価の平台（p.rankrate がある。いまは U-NEXT）。話は無い。
+ * 順位は 20 位まで（外は圏外）、評価は 0.5 刻みで動きが遅い。
+ */
+function renderRankRatePlatform(pid, p, work) {
+  const meta = PLATMETA[pid] || {};
+  const pname = meta.name || pid;
+  const rr = p.rankrate;
+  const st = (v) => (v == null ? "—" : "★" + v.toFixed(1));
+  const cours = (rr.cours || []).map((c) => `<tr>
+      <td class="title-cell">${AD.esc(c.label)}</td>
+      <td class="num">${c.avg == null ? "—" : c.avg}</td>
+      <td class="num">${c.best == null ? "—" : c.best + " 位"}</td>
+      <td class="num">${c.avg_days || 0}</td>
+    </tr>`).join("");
+  return `
+    <div class="stats">
+      ${statCard("人気順位", rr.rank == null ? "圏外" : rr.rank + " 位",
+                 rr.prev == null ? rr.day + " 時点" : "前回 " + rr.prev + " 位 · " + rr.day)}
+      ${statCard("評価", st(rr.rate), rr.rate_delta ? "前回比 " + (rr.rate_delta > 0 ? "+" : "") +
+                 rr.rate_delta.toFixed(1) : "0.5 刻み")}
+      ${statCard("20 位に入った日", String((rr.series || []).length), "記録のある日数")}
+      ${idCard(rr.platform_ids, p)}
+    </div>
+
+    ${(rr.series || []).length ? `<div class="panel">
+      <h2>人気順位の推移 <span class="tag">${AD.esc(pname)}</span>
+        <span class="hint">20 位まで · 圏外の日は点が無い</span></h2>
+      ${AD.lineChart([{ name: work.title, points: rr.series }],
+        { invert: true, floor: 1, ceil: 20, fmt: (v) => Math.round(v) + " 位" })}
+      ${cours ? `<table><thead><tr><th>クール</th><th class="num">平均順位</th><th class="num">最高位</th>
+        <th class="num">20 位に入った日</th></tr></thead><tbody>${cours}</tbody></table>` : ""}
+    </div>` : `<div class="panel"><div class="empty">${AD.esc(pname)} の 20 位以内に入った日はまだ無い。</div></div>`}
+
+    ${(rr.rate_series || []).length > 1 ? `<div class="panel">
+      <h2>評価の推移 <span class="tag">${AD.esc(pname)}</span>
+        <span class="hint">星 5 つまで・0.5 刻み</span></h2>
+      ${AD.lineChart([{ name: work.title, points: rr.rate_series }],
+        { floor: 0, ceil: 5, fmt: (v) => "★" + v.toFixed(1) })}
+    </div>` : ""}`;
+}
+
+/**
+ * 順位だけの平台（p.rankonly がある。いまは Hulu と FOD）。話は無い。
+ * FOD は放送中の一覧を全部取るので、深さ（ro.depth）の代わりに ro.scope と ro.note を渡す。
+ * Lemino は順位のほかに数字（お気に入り・評価）があるので、ro.stats（カードの並び）を足す。
+ * 数字が一つも出ていないので、順位の外に落ちた日は**記録が無い**（圏外）。
+ */
+function renderRankOnlyPlatform(pid, p, work) {
+  const meta = PLATMETA[pid] || {};
+  const pname = meta.name || pid;
+  const ro = p.rankonly;
+  const ceil = Math.max(20, ...(ro.series || []).map((x) => x.v || 0));
+  const cours = (ro.cours || []).map((c) => `<tr>
+      <td class="title-cell">${AD.esc(c.label)}</td>
+      <td class="num">${c.avg == null ? "—" : c.avg}</td>
+      <td class="num">${c.best == null ? "—" : c.best + " 位"}</td>
+      <td class="num">${c.avg_days || 0}</td>
+    </tr>`).join("");
+  return `
+    <div class="stats">
+      ${statCard("順位", ro.rank == null ? "圏外" : ro.rank + " 位",
+                 ro.prev == null ? ro.day + " 時点" : "前回 " + ro.prev + " 位 · " + ro.day)}
+      ${statCard("順位の付いた日", String((ro.series || []).length), "記録のある日数")}
+      ${(ro.stats || []).map((s) => statCard(s.label, AD.esc(s.value), s.sub)).join("")}
+      ${statCard("使った表", AD.esc(ro.chart || ""), ro.scope ? AD.esc(ro.scope) : "上位 " + (ro.depth || "") + " まで")}
+      ${idCard(ro.platform_ids, p)}
+    </div>
+
+    ${(ro.series || []).length ? `<div class="panel">
+      <h2>順位の推移 <span class="tag">${AD.esc(pname)}</span>
+        <span class="hint">${AD.esc(ro.chart || "")} · ${ro.scope ? AD.esc(ro.scope) : "上位 " + (ro.depth || "") + " まで"} · 圏外の日は点が無い</span></h2>
+      ${AD.lineChart([{ name: work.title, points: ro.series }],
+        { invert: true, floor: 1, ceil, fmt: (v) => Math.round(v) + " 位" })}
+      ${cours ? `<table><thead><tr><th>クール</th><th class="num">平均順位</th><th class="num">最高位</th>
+        <th class="num">順位の付いた日</th></tr></thead><tbody>${cours}</tbody></table>` : ""}
+    </div>` : `<div class="panel"><div class="empty">${AD.esc(pname)} の順位に入った日はまだ無い。</div></div>`}
+
+    <div class="panel"><div class="empty" style="padding:12px 16px;text-align:left">${ro.note ? ro.note : `
+      ${AD.esc(pname)} は視聴数もお気に入り数も評価も公開していない。取れるのは<b>順位だけ</b>。
+      上位 ${ro.depth || ""} の外に落ちた日は記録が無い —— 0 位でも最下位でもなく、<b>分からない</b>。`}
+    </div></div>`;
+}
+
+function renderPlatform(pid, p, work) {
+  if (p.favorite) return renderFavoritePlatform(pid, p, work);
+  if (p.rankrate) return renderRankRatePlatform(pid, p, work);
+  if (p.rankcount) return renderRankCountPlatform(pid, p, work);
+  if (p.rankonly) return renderRankOnlyPlatform(pid, p, work);
+  if (p.weekly) return renderWeeklyPlatform(pid, p, work);
+  const meta = PLATMETA[pid] || {};
+  const pname = meta.name || pid;
+  const mname = (meta.metrics && meta.metrics[0] && meta.metrics[0].name) || "視聴数";
+  const byNo = {};
+  p.episodes.forEach((e) => { byNo[e.no] = e; });
+  const last = p.series[p.series.length - 1] || { v: {} };
+  const prev = p.series.length > 1 ? p.series[p.series.length - 2] : null;
+
+  const cour = coursOf(work, p).find((c) => c.season === SEASON && c.ep_from != null);
+  const inScope = (e) => {
+    if (SCOPE !== "cour" || !cour) return true;
+    return e.no >= cour.ep_from && e.no <= cour.ep_to;
+  };
+  const items = p.episodes
+    .filter(inScope)
+    .filter((e) => last.v[String(e.no)] != null)
+    .map((e) => ({ k: String(e.disp != null ? e.disp : e.no),
+                   t: e.title || ("第" + (e.disp || e.no) + "話"),
+                   v: last.v[String(e.no)] }));
+
+  const total = items.reduce((a, b) => a + b.v, 0);
+  const ep1 = items.length ? items[0].v : 0;
+  const lastV = items.length ? items[items.length - 1].v : 0;
+  const scoped0 = p.episodes.filter(inScope).filter((x) => last.v[String(x.no)] != null);
+  const delta = prev ? items.reduce((a, e, i) => {
+    const no = scoped0[i].no;
+    const pv = prev.v[String(no)];
+    return pv == null ? a : a + (e.v - pv);
+  }, 0) : null;
+
+  // 話ごとの増減。時系列が 2 点しか無いうちは薄いが、日が経つほど効いてくる。
+  const scoped = p.episodes.filter(inScope).filter((x) => last.v[String(x.no)] != null);
+  const rows = items.map((e, i) => {
+    const no = scoped[i].no;
+    const pv = prev ? prev.v[String(no)] : null;
+    const d = pv == null ? null : e.v - pv;
+    const share = ep1 ? e.v / ep1 : 0;
+    return `<tr>
+      <td class="rank">${AD.esc(e.k)}</td>
+      <td class="title-cell">${AD.esc(e.t)}</td>
+      <td class="num">${AD.int(e.v)}</td>
+      <td class="num hide-sm">
+        <div class="ret"><span>${(share * 100).toFixed(0)}%</span>
+          <span class="track"><span class="fill" style="width:${
+            Math.min(100, share * 100).toFixed(0)}%"></span></span></div></td>
+      <td class="num">${AD.signed(d)}</td>
+    </tr>`;
+  }).join("");
+
+  const seriesPanel = (SCOPE === "series" && (p.siblings || []).length > 1) ? `
+    <div class="panel">
+      <h2>${AD.esc(p.series_title || "シリーズ")} <span class="tag">${AD.esc(p.series_id || "")}</span>
+        <span class="hint">${p.siblings.length} 季を合算</span></h2>
+      <table><thead><tr><th>季</th><th class="num">話</th>
+        <th class="num">累計視聴数</th></tr></thead><tbody>
+        ${p.siblings.map((s2) => `<tr>
+          <td class="title-cell">${AD.esc(s2.title) || AD.esc(s2.platform_id)}
+            <span class="meta">${AD.esc(s2.platform_id)}</span></td>
+          <td class="num">${s2.eps}</td><td class="num">${AD.int(s2.total)}</td></tr>`).join("")}
+        <tr><td><strong>合計</strong></td>
+          <td class="num"><strong>${p.siblings.reduce((a, b) => a + b.eps, 0)}</strong></td>
+          <td class="num"><strong>${AD.int(p.siblings.reduce((a, b) => a + b.total, 0))}</strong></td></tr>
+      </tbody></table>
+    </div>` : "";
+
+  return `
+    ${scopeBar(work, p)}
+    ${seriesPanel}
+    <div class="stats">
+      ${statCard("累計" + mname, AD.man(total), AD.int(total))}
+      ${statCard("第1話", AD.man(ep1), "")}
+      ${statCard("最新話", AD.man(lastV), items.length ? "第" + items[items.length - 1].k + "話" : "")}
+      ${statCard("継続率", ep1 ? (lastV / ep1 * 100).toFixed(1) + "%" : "—", "最新話 ÷ 第1話")}
+      ${statCard("直近の増加", delta == null ? "—" : AD.signed(delta),
+                 prev ? prev.day + " → " + last.day : "比較対象がまだ無い")}
+      ${idCard(p.platform_id, p)}
+    </div>
+
+    <div class="panel">
+      <h2>話ごとの${AD.esc(mname)} <span class="tag">${AD.esc(pname)}</span>
+        <span class="hint">${SCOPE === "cour" && cour
+          ? AD.esc(cour.cour_title || SEASON) + `（第${cour.ep_from}〜${cour.ep_to}話）`
+          : "全話"} · ${AD.esc(last.day)} 時点</span></h2>
+      <div class="chart">${AD.barChart(items)}</div>
+      <table><thead><tr>
+        <th class="rank">話</th><th>サブタイトル</th>
+        <th class="num">${AD.esc(mname)}</th>
+        <th class="num hide-sm">第1話比</th>
+        <th class="num">増加</th>
+      </tr></thead><tbody>${rows}</tbody></table>
+    </div>
+
+    <div class="panel">
+      <h2>取得の記録 <span class="hint">${p.series.length} 回分</span></h2>
+      <table><thead><tr><th>日付</th><th class="num">本編の話数</th>
+        <th class="num">合計${AD.esc(mname)}</th></tr></thead><tbody>
+        ${p.series.map((s) => {
+          const vals = p.episodes.map((e) => s.v[String(e.no)]).filter((x) => x != null);
+          return `<tr><td class="num" style="text-align:left">${AD.esc(s.day)}</td>
+            <td class="num">${vals.length}</td>
+            <td class="num">${AD.int(vals.reduce((a, b) => a + b, 0))}</td></tr>`;
+        }).join("")}
+      </tbody></table>
+      <div class="empty" style="padding:12px 16px;text-align:left">
+        話数が日によって違うのは、配信期限切れで話が落ちたり、新しい話が上がったりするため。
+        なので増加はクール合計の引き算ではなく<strong>話ごとに突き合わせて</strong>計算している。
+      </div>
+    </div>`;
+}
+
+(async () => {
+  document.body.insertAdjacentHTML("afterbegin", AD.defs());
+  if (!ID) { document.getElementById("body").innerHTML =
+    '<div class="panel"><div class="empty">作品 ID が無い。</div></div>'; return; }
+  let w;
+  try { w = await AD.json("data/work-" + encodeURIComponent(ID) + ".json"); }
+  catch (e) {
+    document.getElementById("body").innerHTML =
+      `<div class="panel"><div class="empty">この作品のデータが見つからない（${AD.esc(e.message)}）。</div></div>`;
+    return;
+  }
+  document.title = w.title + " — アニメ配信データ";
+  const alt = [w.titles.romaji, w.titles.en].filter(Boolean).join(" / ");
+  document.getElementById("head").innerHTML = `<div class="work-head">
+    <h1>${AD.esc(w.title)}</h1>
+    <div class="alt">${AD.esc(alt)}</div>
+    <div class="sub" style="margin-top:8px;color:var(--text-mute);font-family:var(--mono);font-size:12px">
+      ${AD.esc(w.label)} · ${AD.esc(w.format || "")}${
+        w.planned_eps ? " · 全" + w.planned_eps + "話" : ""}${
+        w.start_date ? " · " + AD.esc(w.start_date) + " 開始" : ""} · <a href="https://bangumi.tv/subject/${w.work_id}" target="_blank"
+         rel="noopener">bgm ${w.work_id} ↗</a>
+    </div></div>`;
+
+  WORK = w;
+  try {
+    const idx = await AD.json("data/index.json");
+    (idx.platforms || []).forEach((p) => { PLATMETA[p.id] = p; });
+  } catch (_) { /* 名前が引けなくても ID で出す */ }
+  const draw = () => {
+    // 並びは首頁と同じ（index.json の platforms の順）。来た平台（?p=）だけは先頭に。
+    // 平台が 2 つ以上なら見出しで区切る
+    const order = Object.keys(PLATMETA);
+    const pos = (pid) => (order.indexOf(pid) < 0 ? order.length : order.indexOf(pid));
+    const ids = Object.keys(w.platforms).sort((a, b) => pos(a) - pos(b));
+    ids.sort((a, b) => (b === PLAT) - (a === PLAT));
+    const head = (pid) => ids.length > 1
+      ? `<h2 class="plat-head" style="margin:26px 0 12px">${
+          AD.esc((PLATMETA[pid] || {}).name || pid)}</h2>` : "";
+    document.getElementById("body").innerHTML = ids.length
+      ? ids.map((pid) => head(pid) + renderPlatform(pid, w.platforms[pid], w)).join("")
+      : '<div class="panel"><div class="empty">配信データがまだ無い。</div></div>';
+  };
+  draw();
+  document.addEventListener("click", (e) => {
+    const b = e.target.closest && e.target.closest("[data-scope]");
+    if (!b) return;
+    SCOPE = b.dataset.scope;
+    const u = new URL(location.href);
+    u.searchParams.set("scope", SCOPE);
+    history.replaceState(null, "", u);
+    draw();
+  });
+})();
+</script>
+</body>
+</html>
